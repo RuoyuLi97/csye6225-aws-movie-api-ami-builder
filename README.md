@@ -131,8 +131,9 @@ EC2_SSH_KEY: Private SSH key for EC2 instance access and configuration
 1. Configure valid AWS credentials with EC2, IAM, and VPC permissions
 2. Generate valid SSH key pair and configure in AWS
 3. Set appropriate database credentials for your deployment
-4. Update all GitHub repository secrets with actual values
-5. Ensure AWS account has sufficient permissions for full infrastructure provisioning
+4. **Update JWT secret key in `src/main/resources/application.yaml`** (currently set to placeholder value)
+5. Update all GitHub repository secrets with actual values
+6. Ensure AWS account has sufficient permissions for full infrastructure provisioning
 
 ## CloudWatch Monitoring
 Pre-configured metrics collection includes:
