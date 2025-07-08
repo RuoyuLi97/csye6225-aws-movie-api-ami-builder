@@ -19,4 +19,4 @@ spring:
       com.zaxxer.hikari: DEBUG
 
 secret:
-  key: your-256-bit-secret1234567890123
+  key: PLACEHOLDER-JWT-SECRET-UPDATE-FOR-PRODUCTION
