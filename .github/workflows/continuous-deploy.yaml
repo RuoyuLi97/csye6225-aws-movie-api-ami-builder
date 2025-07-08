@@ -1,0 +1,666 @@
+name: Continuous Deploy
+
+on:
+  workflow_dispatch:
+#   push:
+#     branches:
+#       - main
+
+jobs:
+  create_vpc:
+    name: Create VPC and Setup Network Resources
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{secrets.AWS_ACCESS_KEY_ID}}
+        aws-secret-access-key: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+        aws-region: us-west-2
+    
+    - name: Create VPC and Network Resources
+      id: create_vpc
+      run: |
+        VPC_ID=$(aws ec2 create-vpc --cidr-block "10.0.0.0/16" --query "Vpc.VpcId" --output text)
+        echo "VPC_ID=$VPC_ID" >> $GITHUB_ENV
+        echo "$VPC_ID" > vpc_id.txt
+        
+        PUBLIC_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block "10.0.1.0/24" --availability-zone us-west-2a --query "Subnet.SubnetId" --output text)
+        PRIVATE_SUBNET_ID=$(aws ec2 create-subnet --vpc-id $VPC_ID --cidr-block "10.0.2.0/24" --availability-zone us-west-2a --query "Subnet.SubnetId" --output text)
+        echo "$PUBLIC_SUBNET_ID" > public_subnet_id.txt
+        echo "$PRIVATE_SUBNET_ID" > private_subnet_id.txt
+
+        aws ec2 modify-subnet-attribute --subnet-id $PUBLIC_SUBNET_ID --map-public-ip-on-launch
+        
+        IGW_ID=$(aws ec2 create-internet-gateway --query "InternetGateway.InternetGatewayId" --output text)
+        aws ec2 attach-internet-gateway --vpc-id $VPC_ID --internet-gateway-id $IGW_ID
+        echo "$IGW_ID" > igw_id.txt
+        
+        ROUTE_TABLE_PUBLIC_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query "RouteTable.RouteTableId" --output text)
+        ROUTE_TABLE_PRIVATE_ID=$(aws ec2 create-route-table --vpc-id $VPC_ID --query "RouteTable.RouteTableId" --output text)
+
+        aws ec2 create-route --route-table-id $ROUTE_TABLE_PUBLIC_ID --destination-cidr-block "0.0.0.0/0" --gateway-id $IGW_ID
+        echo "$ROUTE_TABLE_PUBLIC_ID" > route_table_public_id.txt
+        echo "$ROUTE_TABLE_PRIVATE_ID" > route_table_private_id.txt
+
+        aws ec2 associate-route-table --route-table-id $ROUTE_TABLE_PUBLIC_ID --subnet-id $PUBLIC_SUBNET_ID
+        aws ec2 associate-route-table --route-table-id $ROUTE_TABLE_PRIVATE_ID --subnet-id $PRIVATE_SUBNET_ID
+
+        echo "Public subnet $PUBLIC_SUBNET_ID and Private subnet $PRIVATE_SUBNET_ID created"
+
+    - name: Create Security Group for Web App
+      id: webapp_sg
+      run: |
+          WEBAPP_SG=$(aws ec2 create-security-group \
+            --group-name csyeWebAppSG \
+            --description "Security group for Web App" \
+            --vpc-id ${{env.VPC_ID}} \
+            --query 'GroupId' --output text)
+          echo "Security Group ID for Web App: $WEBAPP_SG"
+          echo "WEBAPP_SG=$WEBAPP_SG" >> $GITHUB_ENV
+          echo "$WEBAPP_SG" > webapp_sg.txt
+    
+    - name: Create Security Group for MySQL
+      id: mysql_sg
+      run: |
+          MYSQL_SG=$(aws ec2 create-security-group \
+            --group-name csyeMySQLSG \
+            --description "Security group for MySQL" \
+            --vpc-id ${{env.VPC_ID}}  \
+            --query 'GroupId' --output text)
+          echo "Security Group ID for MySQL: $MYSQL_SG"
+          echo "MYSQL_SG=$MYSQL_SG" >> $GITHUB_ENV
+          echo "$MYSQL_SG" > mysql_sg.txt
+    
+    - name: Add Inbound and Outbound Rules for Web App
+      run: |
+        aws ec2 authorize-security-group-ingress \
+          --group-id ${{env.WEBAPP_SG}}  \
+          --protocol tcp --port 22 --cidr 0.0.0.0/0
+          
+        aws ec2 authorize-security-group-ingress \
+          --group-id ${{env.WEBAPP_SG}} \
+          --protocol tcp --port 80 --cidr 0.0.0.0/0
+          
+        aws ec2 authorize-security-group-ingress \
+          --group-id ${{env.WEBAPP_SG}} \
+          --protocol tcp --port 443 --cidr 0.0.0.0/0
+          
+        aws ec2 authorize-security-group-egress \
+          --group-id ${{env.WEBAPP_SG}} \
+          --protocol tcp --port 3306 --source-group ${{env.MYSQL_SG}}
+    
+    - name: Add Inbound Rules for MySQL
+      run: |
+        aws ec2 authorize-security-group-ingress \
+          --group-id ${{env.MYSQL_SG}} \
+          --protocol tcp --port 3306 --source-group ${{env.WEBAPP_SG}}
+        
+        aws ec2 authorize-security-group-ingress \
+          --group-id ${{env.MYSQL_SG}} \
+          --protocol tcp --port 22 --source-group ${{env.WEBAPP_SG}}
+    
+    - name: Upload VPC Information Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: vpc-info
+        path: |
+          vpc_id.txt
+          public_subnet_id.txt
+          private_subnet_id.txt
+          igw_id.txt
+          webapp_sg.txt
+          mysql_sg.txt
+          route_table_public_id.txt
+          route_table_private_id.txt
+
+  set_up_mysql:
+    name: Set up AMI for MySQL and MySQL Instance
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    needs: create_vpc
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{secrets.AWS_ACCESS_KEY_ID}}
+        aws-secret-access-key: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+        aws-region: us-west-2
+    
+    - name: Download VPC Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: vpc-info
+    
+    - name: Launch Temp EC2 Instance
+      id: temp_instance
+      run: |
+        TEMP_ID=$(aws ec2 run-instances \
+          --image-id ami-00c257e12d6828491 \
+          --instance-type t2.micro \
+          --security-group-ids $(cat webapp_sg.txt) \
+          --key-name csyeAssign2 \
+          --subnet-id $(cat public_subnet_id.txt) \
+          --query 'Instances[0].InstanceId' \
+          --output text)
+        echo "TEMP_ID=$TEMP_ID" >> $GITHUB_ENV
+        echo "$TEMP_ID" > temp_id.txt
+    
+    - name: Wait for Temp Instance ready
+      run: |
+        aws ec2 wait instance-status-ok \
+          --instance-ids ${{env.TEMP_ID}}
+    
+    - name: Get Temp Public IP
+      id: temp_ip
+      run: |
+        TEMP_IP=$(aws ec2 describe-instances --instance-ids ${{env.TEMP_ID}} \
+          --query 'Reservations[*].Instances[*].PublicIpAddress' --output text)
+        
+        echo "Temp Public IP: ${TEMP_IP}"
+    
+        if [ "${TEMP_IP}" == "None" ]; then
+          echo "Error: No public IP found"
+          exit 1
+        fi
+        
+        echo "TEMP_IP=$TEMP_IP" >> $GITHUB_ENV
+    
+    - name: Install MySQL Server on EC2 using SSH
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.TEMP_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          sudo apt-get clean
+          sudo apt-get update -y --fix-missing || { echo "Failed to update APT sources"; exit 1; }
+
+          sudo apt install -y mysql-server || { echo "MySQL Server installation failed"; exit 1; }
+          sudo systemctl start mysql || { echo "Failed to start MySQL"; exit 1; }
+          sudo systemctl enable mysql || { echo "Failed to enable MySQL on boot"; exit 1; }
+
+          if systemctl status mysql | grep "running"; then
+            echo "MySQL Server installed and running successfully."
+            mysql --version
+          else
+            echo "MySQL installation failed."
+            exit 1
+          fi
+
+          echo "Proceeding to the next step."
+
+    - name: Create AMI from Temp Instance
+      run: |
+        INSTANCE_ID=${{env.TEMP_IP}}
+        AMI_NAME="AMI-for-MySQL"
+        echo "Creating AMI from instance ID: ${{env.TEMP_ID}}"
+          
+        AMI_ID=$(aws ec2 create-image --instance-id ${{env.TEMP_ID}} --name "$AMI_NAME" --no-reboot --query 'ImageId' --output text)
+        echo "AMI creation initiated. AMI ID: $AMI_ID"
+        echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV
+        echo "$AMI_ID" > ami_id.txt
+    
+    - name: Wait for AMI to be available
+      run: |
+        # Wait until the AMI is in "available" state
+        echo "Waiting for the AMI to become available..."
+        while true; do
+          AMI_STATUS=$(aws ec2 describe-images --image-ids ${{env.AMI_ID}} --query 'Images[0].State' --output text)
+          if [ "$AMI_STATUS" == "available" ]; then
+            echo "AMI is now available."
+            break
+          else
+            echo "AMI is still in state: $AMI_STATUS. Retrying in 30 seconds..."
+            sleep 30
+          fi
+        done
+
+    - name: Upload Temp Information Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: temp-info
+        path: |
+          temp_id.txt
+          ami_id.txt
+    
+    - name: Launch MySQL EC2 Instance
+      id: mysql_instance
+      run: |
+        MYSQL_INSTANCE_ID=$(aws ec2 run-instances \
+          --image-id ${{env.AMI_ID}} \
+          --instance-type t2.micro \
+          --security-group-ids $(cat mysql_sg.txt) \
+          --key-name csyeAssign2 \
+          --subnet-id $(cat private_subnet_id.txt) \
+          --query 'Instances[0].InstanceId' \
+          --output text)
+        
+        echo "MYSQL_INSTANCE_ID=$MYSQL_INSTANCE_ID" >> $GITHUB_ENV
+        echo "$MYSQL_INSTANCE_ID" > mysql_instance_id.txt
+    
+    - name: Wait for MySQL Instance ready
+      run: |
+        aws ec2 wait instance-status-ok \
+          --instance-ids ${{env.MYSQL_INSTANCE_ID}}
+    
+    - name: Attach EBS volume to EC2 instance
+      run: |
+        VOLUME_ID="vol-00363ba4d795d7a92"
+        INSTANCE_ID=${{env.MYSQL_INSTANCE_ID}}
+        DEVICE_NAME="/dev/sdf"
+        aws ec2 attach-volume \
+        --volume-id $VOLUME_ID \
+        --instance-id $INSTANCE_ID \
+        --device $DEVICE_NAME
+    
+    - name: Get MySQL Instance Private IP
+      run: |
+        MYSQL_PRIVATE_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{env.MYSQL_INSTANCE_ID}} \
+          --query 'Reservations[*].Instances[*].PrivateIpAddress' \
+          --output text)
+        echo "$MYSQL_PRIVATE_IP" > mysql_private_ip.txt
+    
+    - name: Upload MySQL Info Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mysql-info
+        path: |
+          mysql_instance_id.txt
+          mysql_private_ip.txt
+
+  set_up_webapp_and_database:
+    name: Set up Web App Instance and Database
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    needs: set_up_mysql
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{secrets.AWS_ACCESS_KEY_ID}}
+        aws-secret-access-key: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+        aws-region: us-west-2
+    
+    - name: Download VPC Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: vpc-info
+
+    - name: Launch Web App EC2 Instance
+      id: webapp_instance
+      run: |
+        WEBAPP_INSTANCE_ID=$(aws ec2 run-instances \
+          --image-id ami-00c257e12d6828491 \
+          --instance-type t2.micro \
+          --security-group-ids $(cat webapp_sg.txt) \
+          --key-name csyeAssign2 \
+          --subnet-id $(cat public_subnet_id.txt) \
+          --query 'Instances[0].InstanceId' \
+          --output text)
+        
+        echo "WEBAPP_INSTANCE_ID=$WEBAPP_INSTANCE_ID" >> $GITHUB_ENV
+        echo "$WEBAPP_INSTANCE_ID" > webapp_instance_id.txt
+
+    - name: Wait for Web App Instance ready
+      run: |
+        aws ec2 wait instance-status-ok \
+          --instance-ids ${{env.WEBAPP_INSTANCE_ID}}
+
+    - name: Get Web App Instance Private IP
+      run: |
+        WEBAPP_PRIVATE_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{env.WEBAPP_INSTANCE_ID}} \
+          --query 'Reservations[*].Instances[*].PrivateIpAddress' \
+          --output text)
+        echo "WEBAPP_PRIVATE_IP=$WEBAPP_PRIVATE_IP" >> $GITHUB_ENV
+        echo "$WEBAPP_PRIVATE_IP" > webapp_private_ip.txt
+    
+    - name: Get Web App Instance Public IP
+      run: |
+        WEBAPP_PUBLIC_IP=$(aws ec2 describe-instances \
+          --instance-ids ${{env.WEBAPP_INSTANCE_ID}} \
+          --query 'Reservations[*].Instances[*].PublicIpAddress' \
+          --output text)
+        echo "WEBAPP_PUBLIC_IP=$WEBAPP_PUBLIC_IP" >> $GITHUB_ENV
+        echo "$WEBAPP_PUBLIC_IP" > webapp_public_ip.txt
+
+    - name: Install MySQL Client on Web App Instance
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_PUBLIC_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          sudo apt-get clean
+          sudo apt-get update -y --fix-missing || { echo "Failed to update APT sources"; exit 1; }
+
+          sudo apt install mysql-client-core-8.0 -y || { echo "MySQL client installation failed"; exit 1; }
+
+          if command -v mysql &> /dev/null; then
+            echo "MySQL client installed successfully."
+            mysql --version
+          else
+            echo "MySQL command not found."
+            exit 1
+          fi
+    
+    - name: Install Java on Web App Instance
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_PUBLIC_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          sudo apt-get clean
+          sudo apt-get update -y --fix-missing || { echo "Failed to update APT sources"; exit 1; }
+
+          sudo apt install -y openjdk-21-jre-headless || { echo "Java installation failed"; exit 1; }
+
+          if command -v java &> /dev/null; then
+            echo "Java installed successfully."
+            java -version
+          else
+            echo "Java command not found."
+            exit 1
+          fi
+    
+    - name: Download MySQL Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mysql-info
+    
+    - name: Retrive Database Info
+      run: |
+        echo ${{secrets.DATABASE_USER_NAME}} > database_user_name.txt
+        echo ${{secrets.DATABASE_PASSWORD}} > database_password.txt
+    
+    - name: Create `secrets` Directory Exists on Web App
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_PUBLIC_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          mkdir -p ~/secrets
+    
+    - name: Set up SSH Key File
+      run: |
+        echo "${{secrets.EC2_SSH_KEY}}" > ec2_key.pem
+        chmod 600 ec2_key.pem
+
+    - name: Transfer the secrets to Web App
+      run: |
+        scp -o StrictHostKeyChecking=no -i ec2_key.pem mysql_private_ip.txt ubuntu@${{env.WEBAPP_PUBLIC_IP}}:~/secrets/mysql_private_ip.txt
+        scp -o StrictHostKeyChecking=no -i ec2_key.pem webapp_private_ip.txt ubuntu@${{env.WEBAPP_PUBLIC_IP}}:~/secrets/webapp_private_ip.txt
+        scp -o StrictHostKeyChecking=no -i ec2_key.pem database_user_name.txt ubuntu@${{env.WEBAPP_PUBLIC_IP}}:~/secrets/database_user_name.txt
+        scp -o StrictHostKeyChecking=no -i ec2_key.pem database_password.txt ubuntu@${{env.WEBAPP_PUBLIC_IP}}:~/secrets/database_password.txt
+        scp -o StrictHostKeyChecking=no -i ec2_key.pem ec2_key.pem ubuntu@${{env.WEBAPP_PUBLIC_IP}}:~/secrets/ec2_key.pem
+
+    - name: SSH into MySQL Instance to attach the EBS volumn
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_PUBLIC_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          MYSQL_PRIVATE_IP=$(cat ~/secrets/mysql_private_ip.txt)
+          echo "MYSQL_PRIVATE_IP is $MYSQL_PRIVATE_IP"
+
+          ssh -o StrictHostKeyChecking=no -i ~/secrets/ec2_key.pem ubuntu@$MYSQL_PRIVATE_IP << "EOF"
+            sudo mkdir -p /mnt/mysql-data
+            sudo mount /dev/xvdf /mnt/mysql-data
+            sudo chown -R mysql:mysql /mnt/mysql-data
+            sudo chmod -R 755 /mnt/mysql-data
+
+            sudo systemctl stop mysql
+
+            sudo sed -i 's|^#\s*datadir\s*=.*|datadir = /mnt/mysql-data/|' /etc/mysql/mysql.conf.d/mysqld.cnf
+
+            sudo sed -i '/^}$/i\/mnt/mysql-data/ r,' /etc/apparmor.d/usr.sbin.mysqld
+            sudo sed -i '/^}$/i\/mnt/mysql-data/** rwk,' /etc/apparmor.d/usr.sbin.mysqld
+            sudo echo "/dev/xvdf /mnt/mysql-data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+
+            sudo systemctl restart apparmor
+            sudo systemctl start mysql
+
+            echo "=== MySQL: SHOW DATABASES ==="
+            sudo mysql -u root -e "SHOW DATABASES;"
+
+            if [ $? -eq 0 ]; then
+              echo "MySQL is running, and databases are listed."
+            else
+              echo "Error: MySQL is not running or data is inaccessible."
+            fi
+          EOF
+
+    - name: SSH into MySQL Instance to Change the Bind Address
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_PUBLIC_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          MYSQL_PRIVATE_IP=$(cat ~/secrets/mysql_private_ip.txt)
+          echo "MYSQL_PRIVATE_IP is $MYSQL_PRIVATE_IP"
+
+          WEBAPP_PRIVATE_IP=$(cat ~/secrets/webapp_private_ip.txt)
+          echo "WEBAPP_PRIVATE_IP is $WEBAPP_PRIVATE_IP"
+
+          scp -o StrictHostKeyChecking=no -i ~/secrets/ec2_key.pem ubuntu@$WEBAPP_PRIVATE_IP:webapp_private_ip.txt ubuntu@$MYSQL_PRIVATE_IP:webapp_private_ip.txt
+
+          ssh -o StrictHostKeyChecking=no -i ~/secrets/ec2_key.pem ubuntu@$MYSQL_PRIVATE_IP << "EOF"
+            WEBAPP_PRIVATE_IP=$(cat webapp_private_ip.txt)
+            echo "WEBAPP_PRIVATE_IP is $WEBAPP_PRIVATE_IP"
+
+            sudo sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+            sudo sed -i 's/^mysqlx-bind-address.*/mysqlx-bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+            sudo systemctl restart mysql
+
+            sudo mysql -u root -e "CREATE USER 'root'@'${WEBAPP_PRIVATE_IP}' IDENTIFIED BY '';"
+            sudo mysql -u root -e "GRANT ALL PRIVILEGES ON *.* TO 'root'@'${WEBAPP_PRIVATE_IP}' WITH GRANT OPTION; FLUSH PRIVILEGES;"
+          EOF
+
+
+    - name: Change the Security Group for Mysql
+      run: |
+        aws ec2 revoke-security-group-ingress \
+          --group-id $(cat mysql_sg.txt) \
+          --protocol tcp \
+          --port 22 \
+          --source-group $(cat webapp_sg.txt)
+    
+    - name: Verify the Connection and Set up Database
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_PUBLIC_IP}}
+        username: ubuntu
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          MYSQL_PRIVATE_IP=$(cat ~/secrets/mysql_private_ip.txt)
+          echo "MYSQL_PRIVATE_IP is $MYSQL_PRIVATE_IP"
+
+          DATABASE_USER_NAME=$(cat ~/secrets/database_user_name.txt)
+          echo "DATABASE_USER_NAME is $DATABASE_USER_NAME"
+
+          DATABASE_PASSWORD=$(cat ~/secrets/database_password.txt)
+          echo "DATABASE_PASSWORD is $DATABASE_PASSWORD"
+
+          echo "Verifying MySQL connection..."
+          if mysql -h $MYSQL_PRIVATE_IP -u root -e "quit"; then
+            echo "MySQL connection successful!"
+          else
+            echo "Failed to connect to MySQL. Exiting."
+            exit 1
+          fi
+
+          mysql -h $MYSQL_PRIVATE_IP -u root -e "CREATE DATABASE IF NOT EXISTS recommend;"
+          if mysql -h $MYSQL_PRIVATE_IP -u root -e "CREATE DATABASE IF NOT EXISTS recommend;"; then
+            echo "'recommend' database created or already exists."
+          else
+            echo "Failed to create the 'recommend' database. Exiting."
+            exit 1
+          fi
+          
+          mysql -h $MYSQL_PRIVATE_IP -u root -e "CREATE USER IF NOT EXISTS '$DATABASE_USER_NAME'@'%' IDENTIFIED BY '$DATABASE_PASSWORD';"
+          mysql -h $MYSQL_PRIVATE_IP -u root -e "GRANT ALL PRIVILEGES ON recommend.* TO '$DATABASE_USER_NAME'@'%';"
+          if mysql -h $MYSQL_PRIVATE_IP -u root -e "GRANT ALL PRIVILEGES ON recommend.* TO '$DATABASE_USER_NAME'@'%';"; then
+            echo "Privileges granted successfully."
+          else
+            echo "Failed to grant privileges. Exiting."
+            exit 1
+          fi
+
+          mysql -h $MYSQL_PRIVATE_IP -u root -e "FLUSH PRIVILEGES;"
+          if mysql -h $MYSQL_PRIVATE_IP -u root -e "FLUSH PRIVILEGES;"; then
+            echo "Privileges flushed successfully."
+          else
+            echo "Failed to flush privileges. Exiting."
+            exit 1
+          fi
+
+    - name: Upload Web App Info Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: webapp-info
+        path: |
+          webapp_instance_id.txt
+          webapp_private_ip.txt
+          webapp_public_ip.txt
+  
+  build:
+    name: Build and Package Application
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    needs: set_up_webapp_and_database
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Download MySQL Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mysql-info
+    
+    - name: Update application.yaml with MySQL Private IP
+      run: |
+        MYSQL_PRIVATE_IP=$(cat mysql_private_ip.txt)
+        sed -i "s|jdbc:mysql://localhost:3306/recommend|jdbc:mysql://$MYSQL_PRIVATE_IP:3306/recommend|g" src/main/resources/application.yaml
+        sed -i 's/\${DATABASE_USER_NAME}/'${{secrets.DATABASE_USER_NAME}}'/g' src/main/resources/application.yaml
+        sed -i 's/\${DATABASE_PASSWORD}/'${{secrets.DATABASE_PASSWORD}}'/g' src/main/resources/application.yaml
+    
+    - name: Set up JDK 21
+      uses: actions/setup-java@v4
+      with: 
+        distribution: 'temurin'
+        java-version: '21'
+
+    - name: Build with Maven
+      run: mvn clean package
+    
+    - name: Debug - Check target directory contents
+      run: ls -lah target/
+    
+    - name: Download Webapp Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: webapp-info
+
+    - name: Set up SSH Key File
+      run: |
+        echo "${{secrets.EC2_SSH_KEY}}" > ssh_key.pem
+        chmod 600 ssh_key.pem
+
+        echo "SSH Key File Content:"
+        cat ssh_key.pem
+        head -n 5 ssh_key.pem
+        ls -l ssh_key.pem
+
+    - name: Transfer the Application to Web App
+      run: |
+        if [ ! -f ssh_key.pem ]; then
+          echo "Error: SSH key file not found!"
+          exit 1
+        fi
+        scp -o StrictHostKeyChecking=no -i ssh_key.pem target/*.jar ubuntu@$(cat webapp_public_ip.txt):~/application.jar
+  
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    needs: build
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+    
+    - name: Download Web App Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: webapp-info
+    
+    - name: Load Web App Host and User into Environment Variables
+      run: |
+        WEBAPP_HOST=$(cat webapp_public_ip.txt)
+        WEBAPP_USER=ubuntu
+        echo "WEBAPP_HOST=${WEBAPP_HOST}" >> $GITHUB_ENV
+        echo "WEBAPP_USER=${WEBAPP_USER}" >> $GITHUB_ENV
+
+    - name: Deploy Application via SSH
+      uses: appleboy/ssh-action@v1.2.0
+      with:
+        host: ${{env.WEBAPP_HOST}}
+        username: ${{env.WEBAPP_USER}}
+        key: ${{secrets.EC2_SSH_KEY}}
+        script: |
+          nohup java -jar ~/application.jar > ~/app.log 2>&1 &
+
+    - name: Download MySQL Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: mysql-info
+    
+    - name: Download VPC Info Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: vpc-info
+
+    - name: Setup Variables for Grader Workflow
+      run: |
+        echo "WEBAPP_HOST=${{env.WEBAPP_HOST}}" > grader-env.txt
+        echo "WEBAPP_USER=${{env.WEBAPP_USER}}" >> grader-env.txt
+        echo "MYSQL_PRIVATE_IP=$(cat mysql_private_ip.txt)" >> grader-env.txt
+        echo "DATABASE_USER_NAME=${{secrets.DATABASE_USER_NAME}}" >> grader-env.txt
+        echo "DATABASE_PASSWORD=${{secrets.DATABASE_PASSWORD}}" >> grader-env.txt
+        
+        # echo "MOVIE_INGEST_COMMAND=bash ~/ingest_movies.sh" >> $GITHUB_ENV
+
+        echo "WEBAPP_INSTANCE_ID=$(cat webapp_instance_id.txt)" >> grader-env.txt
+        echo "MYSQL_INSTANCE_ID=$(cat mysql_instance_id.txt)" >> grader-env.txt
+        echo "WEBAPP_SG=$(cat webapp_sg.txt)" >> grader-env.txt
+        echo "MYSQL_SG=$(cat mysql_sg.txt)" >> grader-env.txt
+        echo "IGW_ID=$(cat igw_id.txt)" >> grader-env.txt
+        echo "PUBLIC_SUBNET_ID=$(cat public_subnect_id.txt)" >> grader-env.txt
+        echo "PRIVATE_SUBNET_ID=$(cat private_subnect_id.txt)" >> grader-env.txt
+        echo "VPC_ID=$(cat vpc_id.txt)" >> $GITHUB_ENV
+    
+    - name: Upload Grader Environment Variables
+      uses: actions/upload-artifact@v4
+      with:
+        name: grader-env
+        path: grader-env.txt

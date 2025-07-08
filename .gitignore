@@ -1,0 +1,21 @@
+# env file
+.env
+
+# vscode 
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/*.code-snippets
+
+# log files
+*.log
+
+# temp files
+*.tmp
+*.swp
+.DS_Store
+
+# target files
+target/

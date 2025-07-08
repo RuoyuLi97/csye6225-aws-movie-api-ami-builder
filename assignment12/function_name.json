@@ -1,0 +1,49 @@
+{
+    "FunctionName": "Assignment12",
+    "FunctionArn": "arn:aws:lambda:us-west-2:490004644373:function:Assignment12",
+    "Runtime": "java17",
+    "Role": "arn:aws:iam::490004644373:role/service-role/Assignment12-role-l9znk24t",
+    "Handler": "com.example.lambda_function::handleRequest",
+    "CodeSize": 7844492,
+    "Description": "",
+    "Timeout": 15,
+    "MemorySize": 512,
+    "LastModified": "2025-04-11T06:21:52.000+0000",
+    "CodeSha256": "i+bBUUFk4j7MnMoVRLJfJ5pOsvmPgktbsY6lfO2nVTI=",
+    "Version": "$LATEST",
+    "VpcConfig": {
+        "SubnetIds": [
+            "subnet-0d62411cb0c25f88b",
+            "subnet-069c67131d4e74d31"
+        ],
+        "SecurityGroupIds": [
+            "sg-09a07e6ef21095345"
+        ],
+        "VpcId": "vpc-07552e21c27fcc743",
+        "Ipv6AllowedForDualStack": false
+    },
+    "TracingConfig": {
+        "Mode": "PassThrough"
+    },
+    "RevisionId": "d51253e5-e1bb-45d1-b4e2-f1464fe8a2a6",
+    "State": "Active",
+    "LastUpdateStatus": "Successful",
+    "PackageType": "Zip",
+    "Architectures": [
+        "x86_64"
+    ],
+    "EphemeralStorage": {
+        "Size": 512
+    },
+    "SnapStart": {
+        "ApplyOn": "None",
+        "OptimizationStatus": "Off"
+    },
+    "RuntimeVersionConfig": {
+        "RuntimeVersionArn": "arn:aws:lambda:us-west-2::runtime:07e1a019fe488fb718021df9129caf01fd13d22d401104a151e929a91a82af7b"
+    },
+    "LoggingConfig": {
+        "LogFormat": "Text",
+        "LogGroup": "/aws/lambda/Assignment12"
+    }
+}

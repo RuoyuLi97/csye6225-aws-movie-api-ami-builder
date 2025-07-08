@@ -1,0 +1,87 @@
+name: Build AMIs with Packer
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-amis:
+    name: Build AMIs
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{secrets.AWS_ACCESS_KEY_ID}}
+          aws-secret-access-key: ${{secrets.AWS_SECRET_ACCESS_KEY}}
+          aws-region: us-west-2
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with: 
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Build with Maven
+        run: mvn clean package
+
+      - name: Move JAR file to Packer directory
+        run: |
+          mv target/csye-app-3.4.1.jar packer/
+          ls -al packer/
+
+      - name: Setup 'packer'
+        uses: hashicorp/setup-packer@main
+        id: setup
+        with:
+          version: latest
+      
+      - name: Initialize 'packer'
+        id: init
+        run: packer init ./packer
+      
+      - name: Validate 'packer'
+        id: validate
+        run: packer validate ./packer
+      
+      - name: Inject AWS Credentials into CloudWatch Config
+        run: |
+          echo "Injecting AWS credentials into the credentials file..."
+          sed -i "s|aws_access_key_id=<key>|aws_access_key_id=${{secrets.AWS_ACCESS_KEY_ID}}|" ./packer/cloudwatch_config_files/credentials
+          sed -i "s|aws_secret_access_key=<secret>|aws_secret_access_key=${{secrets.AWS_SECRET_ACCESS_KEY}}|" ./packer/cloudwatch_config_files/credentials
+
+      - name: Build MySQL AMI
+        run: |
+          packer build -only=amazon-ebs.mysql-ami ./packer | tee packer_mysql_output.log
+      
+      - name: Extract MySQL AMI ID
+        id: get_mysql_ami_id
+        run: |
+          MYSQL_AMI_ID=$(grep -o 'AMI: ami-[^ ]*' packer_mysql_output.log | cut -d' ' -f2 | sed 's/\x1b\[0-9;]*m//g')
+          echo "MySQL AMI ID is $MYSQL_AMI_ID"
+
+          if [ -z "$MYSQL_AMI_ID" ]; then
+            echo "Error: MySQL AMI ID is empty"
+            exit 1
+          fi
+      
+      - name: Build Web App AMI
+        run: |
+          packer build -only=amazon-ebs.webapp-ami ./packer | tee packer_webapp_output.log
+      
+      - name: Extract Web App AMI ID
+        id: get_webapp_ami_id
+        run: |
+          WEBAPP_AMI_ID=$(grep -o 'AMI: ami-[^ ]*' packer_webapp_output.log | cut -d' ' -f2 | sed 's/\x1b\[0-9;]*m//g')
+          echo "Web App AMI ID is $WEBAPP_AMI_ID"
+
+          if [-z "$WEBAPP_AMI_ID"]; then
+            echo "Error: Web App AMI ID is empty"
+            exit 1
+          fi

@@ -1,0 +1,22 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    hikari:
+      connection-timeout: 3000
+      max-lifetime: 180000
+      idle-timeout: 30000
+      minimum-idle: 5
+      maximum-pool-size: 10
+  logging:
+    level:
+      root: INFO
+      org.springframework.security: DEBUG
+      org.springframework.web: DEBUG
+      com.example: DEBUG
+      com.zaxxer.hikari: DEBUG
+
+secret:
+  key: your-256-bit-secret1234567890123

@@ -1,0 +1,15 @@
+# Valid ID (200)
+curl -X GET https://onc39qsdi8.execute-api.us-west-2.amazonaws.com/dev/v3/poster/12345
+{"movie_id": 12345, "poster_url": "https://example.com/posters/12345.jpg", "poster_size": 1024000, "message": "post details fetched successfully"}
+
+# Missing ID (400)
+curl -X GET https://onc39qsdi8.execute-api.us-west-2.amazonaws.com/dev/v3/poster/
+{"error": "Movie id is required!"}
+
+# Invalid Movie ID (400)
+curl -X GET https://onc39qsdi8.execute-api.us-west-2.amazonaws.com/dev/v3/poster/0
+{"error": "Movie id is out of range!"}
+
+# Plain-text response
+curl -H "Content-Type: text/plain" https://onc39qsdi8.execute-api.us-west-2.amazonaws.com/dev/v3/poster/67890
+{"movie_id": 67890, "poster_url": "https://example.com/posters/67890.jpg", "poster_size": 1024000, "message": "post details fetched successfully"}

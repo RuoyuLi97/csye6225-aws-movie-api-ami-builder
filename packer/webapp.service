@@ -1,0 +1,17 @@
+[Unit]
+Description=Web Application Service
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/webapp
+ExecStart=/usr/bin/java -Dspring.datasource.url=jdbc:mysql://${MYSQL_PRIVATE_IP}:3306/recommend \
+                        -Dspring.datasource.username=${DATABASE_USERNAME} \
+                        -Dspring.datasource.password=${DATABASE_PASSWORD} \
+                        -jar /opt/webapp/webapp.jar
+Restart=always
+RestartSec=3
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target

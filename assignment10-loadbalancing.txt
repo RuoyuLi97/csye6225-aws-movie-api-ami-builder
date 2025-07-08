@@ -1,0 +1,5 @@
+# comment
+student_name=Ruoyu Li
+api_domain_name=api.csyeeveryday.me
+assignment_repository=https://github.com/neu-csye6245/assignment-2-cloud-native-web-application-RuoyuLi97
+terraform_repository=https://github.com/neu-csye6245/cloud-project-terraform-aws-infra-RuoyuLi97
