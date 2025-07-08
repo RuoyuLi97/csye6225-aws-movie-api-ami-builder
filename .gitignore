@@ -19,3 +19,6 @@
 
 # target files
 target/
+
+# load balancing file
+assignment10-loadbalancing.txtassignment10-loadbalancing.txt
